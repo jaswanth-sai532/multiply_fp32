@@ -65,6 +65,26 @@ Internal signals:
 - `product`: 50-bit product of mantissas
 - `guard_bit`, `round_bit`, `sticky`: rounding support bits for RNE
 
+## Required Operation Ordering  - jas
+
+The implementation must follow this exact ordering for all normal inputs:
+
+1. Unpack operands
+2. Convert exponent to unbiased domain
+3. Insert hidden leading 1 for normalized operands
+4. Multiply mantissas
+5. Compute result exponent
+6. Extract mantissa and rounding bits
+7. Normalize mantissa if needed
+8. Apply round-to-nearest-even (RNE)
+9. Handle rounding carry overflow
+10. Handle overflow/underflow conditions
+11. Pack IEEE-754 result
+
+Do not reorder normalization, rounding, or exponent adjustment.
+Normalization must happen before rounding.
+Rounding carry propagation must happen before final exponent packing.
+
 ---
 
 ## FSM / Pipeline Stages
@@ -76,60 +96,196 @@ The FSM is controlled by:
 All stage actions are performed inside a single sequential always block using `case(counter)`.
 
 ### Stage 1 — Unpack
-- Extract mantissas into 24-bit regs (initially `{1'b0, frac}`).
-- Convert biased exponent into unbiased form: `exp - 127`.
-- Capture signs.
+- Register inputs `a` and `b` into `a_r` and `b_r`.
+- Extract:
+  - sign = bit 31
+  - exponent = bits [30:23]
+  - mantissa = bits [22:0]
+- Convert exponent to unbiased representation:
 
-### Stage 2 — Special classification + denormal setup
-- Checks operand classes using `a_is_nan`, `a_is_inf`, `a_is_zero`, etc. (derived from `a_r/b_r` fields).
-- For normal operation:
-  - If exponent is nonzero => sets implicit leading 1: `a_m[23] = 1`.
-  - If exponent is zero (subnormal) => forces exponent to -126 (subnormal exponent baseline).
+  `unbiased_exp = exponent - 127`
 
-> If you restrict inputs to **normal numbers only**, then:
-> - `expA` and `expB` are always 1..254,
-> - hidden-one insertion always happens,
-> - special logic is bypassed in practice.
+- Mantissa is initially stored as:
+
+  {1'b0, fraction}
+
+Hidden-one insertion occurs later.
+
+### Stage 2 — Classification + Hidden-One Setup
+- For normal numbers:
+  - exponent field is always within [1..254]
+  - hidden leading one must always be inserted:
+
+    mantissa[23] = 1
+
+- For this task, assume only normal inputs are generated.
+- NaN, INF, zero, and subnormal handling may still exist in RTL but are not required for correctness.
 
 ### Stage 3 — Input normalization (lightweight)
 - If mantissa MSB is not set, shift left and decrement exponent.
 - This is mainly relevant for denormal handling; for strictly normal inputs, this typically does nothing.
 
-### Stage 4 — Multiply core
-- Compute result sign: `z_s = a_s ^ b_s`
-- Exponent add: `z_e = a_e + b_e + 1`
-- Mantissa product: `product = a_m * b_m * 4`
-  - The `*4` scaling aligns the product for extraction into `{z_m, G, R, S}`.
+### Stage 4 — Multiply Core
+- Result sign:
 
-### Stage 5 — Extract mantissa + rounding bits
-- `z_m = product[49:26]`
-- `guard_bit = product[25]`
-- `round_bit = product[24]`
-- `sticky = OR(product[23:0])`
+  `z_s = a_s ^ b_s`
 
-### Stage 6 — Normalize + Round-to-Nearest-Even (RNE)
-This stage performs:
-1. **Underflow alignment** toward exponent -126:
-   - Computes shift amount `sh = (-126 - z_e)` when `z_e < -126`.
-   - Shifts mantissa right and accumulates shifted-out bits into sticky.
-2. **Normalize** if MSB missing:
-   - Left-shifts mantissa while adjusting exponent, carrying guard into LSB.
-3. **RNE rounding**:
-   - If `G == 1` and `(R || S || LSB)` then increment mantissa.
-   - Handles carry-out from rounding:
-     - If rounding overflows mantissa, set mantissa to 0x800000 and increment exponent.
+- Result exponent:
 
-### Stage 7 — Pack
-- For normal path:
-  - Pack sign, biased exponent, fraction.
-  - If exponent indicates overflow -> output INF.
-  - If exponent indicates exact denorm boundary -> force exponent field to 0 (denormal/zero representation).
-- Asserts `out_valid` for one cycle and clears `busy`.
+  `z_e = a_e + b_e`
+
+- Mantissa multiply:
+
+  `product = a_m * b_m`
+
+- `a_m` and `b_m` are 24-bit mantissas including hidden-one.
+- `product` is a 48-bit multiplication result.
+
+Important:
+- Do not pre-normalize product.
+- Do not shift product during multiplication.
+- Normalization occurs later.
+
+### Stage 5 — Mantissa Extraction
+
+- Product is interpreted as a 48-bit value.
+
+For normalized operands:
+- product[47] determines whether normalization shift is required.
+
+---
+
+### Extraction rule:
+
+If product[47] == 1:
+
+- `mantissa_candidate = product[47:24]`
+- guard = product[23]
+- round = product[22]
+- sticky = OR(product[21:0])
+- exponent = exponent + 1
+
+Else:
+
+- `mantissa_candidate = product[46:23]`
+- guard = product[22]
+- round = product[21]
+- sticky = OR(product[20:0])
+
+---
+
+### Sticky bit rule
+
+Sticky bit must include all bits strictly below the round bit position.
+
+No lower bits may be excluded or partially truncated.
+
+---
+
+### Output of this stage:
+
+- `mantissa_candidate (24-bit including hidden bit alignment)`
+- guard bit (G)
+- round bit (R)
+- sticky bit (S)
+- updated exponent (if product[47] == 1)
+
+---
+
+### Constraint:
+
+This extraction must be performed BEFORE rounding and normalization stages.
+No rounding or exponent biasing is allowed in this stage.
+
+
+### Stage 6 — Normalize + Round-to-Nearest-Even
+
+Normalization:
+- After extraction, mantissa must contain a leading 1 in bit[23].
+- If leading 1 is missing:
+  - left shift mantissa
+  - decrement exponent
+
+Round-to-Nearest-Even (RNE):
+
+Definitions:
+- G = guard bit
+- R = round bit
+- S = sticky bit
+- LSB = mantissa[0]
+
+Rounding rule:
+
+Increment mantissa if:
+
+G == 1 AND (R == 1 OR S == 1 OR LSB == 1)
+
+This implements IEEE-754 ties-to-even behavior.
+
+After increment:
+- If mantissa overflows beyond 24 bits:
+  - right shift mantissa by 1
+  - increment exponent
+
+Rounding must happen only after normalization.
+
+### Stage 7 — Pack Result
+- Convert unbiased exponent back to biased form:
+
+Exponent must remain in unbiased form throughout all arithmetic and normalization stages.
+
+Bias (127) must be applied only during final packing stage to form the IEEE-754 encoded exponent.
+
+No arithmetic operation (multiplication, normalization, rounding) shall use biased exponent values.
+
+Overflow:
+- If `exponent_out >= 255`:
+  - output infinity
+
+Underflow:
+- If `exponent_out <= 0`:
+  - output zero
+
+Final output:
+
+z = {
+  sign,
+  `exponent_out[7:0]`,
+  mantissa[22:0]
+}
+
+- Assert `out_valid` for exactly one cycle.
+- Clear busy.
+
+Output Timing Requirement:
+- `out_valid` must assert for exactly one cycle per result.
+- Output must be either combinational or single-cycle registered.
+- Multi-cycle pipelined outputs are not allowed unless explicitly stated.
+
 
 ---
 
 ## Assumptions & Constraints
 - Inputs: `exp ∈ [1..254]` (no zeros/subnormals, no inf/nan)
+
+---
+
+## Simplified Assumptions for This Task
+
+The hidden verification primarily targets normal FP32 multiplication.
+
+Assume:
+- Inputs are normal IEEE-754 numbers
+- No NaN inputs
+- No infinity inputs
+- No denormal inputs
+- No signed zero corner cases
+
+Correctness is determined by:
+- Proper exponent computation
+- Correct mantissa normalization
+- Correct RNE rounding
+- Proper IEEE-754 packing
 
 ---
 
