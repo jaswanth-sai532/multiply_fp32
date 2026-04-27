@@ -286,7 +286,6 @@ Correctness is determined by:
 - Correct mantissa normalization
 - Correct RNE rounding
 - Proper IEEE-754 packing
-
 ---
 
 ## Verification Notes
